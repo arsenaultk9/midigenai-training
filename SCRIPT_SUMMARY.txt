@@ -1,0 +1,66 @@
+=== ONNX Model Music Generation Script ===
+
+FILE: generate_with_onnx.py
+
+DESCRIPTION:
+This script generates music using ONNX models exported from midigenai training runs.
+It uses a random single-note primer and generates a musical sequence using top-p 
+(nucleus) sampling, then decodes the result to MIDI.
+
+KEY FEATURES:
+✓ Loads ONNX models from the models/ folder
+✓ Uses midigenai tokenizer for encoding/decoding
+✓ Generates random single-note primers (configurable pitch and duration)
+✓ Implements top-p (nucleus) sampling for high-quality generation
+✓ Supports CPU and GPU inference
+✓ Uses symusic for MIDI file handling
+✓ Reproducible results with seed support
+✓ Automatically detects tokenizer path
+✓ Detailed progress output
+
+DEPENDENCIES:
+- midigenai (with ONNX support)
+- symusic
+- onnxruntime
+- numpy
+
+USAGE:
+  python generate_with_onnx.py <model_path> [options]
+
+EXAMPLES:
+
+1. Basic generation:
+   python generate_with_onnx.py models/orchestral-scratch
+
+2. Custom output file:
+   python generate_with_onnx.py models/orchestral-scratch -o my_music.mid
+
+3. Reproducible with seed:
+   python generate_with_onnx.py models/orchestral-scratch --seed 42
+
+4. Quick test (20 tokens):
+   python generate_with_onnx.py models/orchestral-scratch -t 20
+
+5. High-quality generation:
+   python generate_with_onnx.py models/orchestral-scratch -t 512 -p 0.85 --temperature 0.9
+
+6. Batch generation:
+   for seed in 1 2 3; do
+     python generate_with_onnx.py models/orchestral-scratch --seed $seed -o gen_$seed.mid
+   done
+
+IMPORTANT NOTES:
+
+- The model uses KV cache for efficient token-by-token generation
+- Top-p sampling (nucleus sampling) is used for diversity control
+- The tokenizer must be available (auto-detected from common locations)
+- Generation speed depends on hardware and number of tokens
+- CPU models (int8) are significantly faster than GPU models with less VRAM
+
+TROUBLESHOOTING:
+
+If tokenizer is not found:
+  python generate_with_onnx.py models/orchestral-scratch \
+    --tokenizer-path /path/to/tokenizer.json
+
+For more detailed information, see GENERATION.md
