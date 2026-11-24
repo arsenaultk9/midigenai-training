@@ -15,3 +15,12 @@ Pass another MIDI folder to the preparation script:
 Training runs on the local CUDA, MPS, or CPU device. `--resume` uses the
 newest checkpoint for the run, or downloads the `v5-rl` checkpoint from
 Hugging Face for a new run. See [TRAINING.md](./TRAINING.md) for more options.
+
+Export a run's final checkpoint to browser-ready ONNX models:
+
+```bash
+./export_onnx.sh runs/orchestral-scratch
+```
+
+This writes `models/orchestral-scratch/` with the ONNX decoders and
+`manifest.json`.
