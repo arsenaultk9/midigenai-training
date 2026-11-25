@@ -166,13 +166,19 @@ if "$RESUME"; then
   if [[ -n "$RESUME_FROM" ]]; then
     CHECKPOINT="$RESUME_FROM"
   else
-    CHECKPOINT="$(
-      find "$OUT_DIR" -maxdepth 1 -type f -name 'ckpt_*.pt' \
-        -printf '%T@ %p\n' 2>/dev/null |
-        sort -nr |
-        head -n 1 |
-        cut -d' ' -f2-
-    )"
+    CHECKPOINT=""
+    if [[ -e "$OUT_DIR" ]]; then
+      if [[ ! -d "$OUT_DIR" ]]; then
+        echo "Output path is not a directory: $OUT_DIR" >&2
+        exit 1
+      fi
+      CHECKPOINT="$(
+        find "$OUT_DIR" -maxdepth 1 -type f -name 'ckpt_*.pt' \
+          -printf '%T@ %p\n' |
+          sort -nr |
+          sed -n '1s/^[^ ]* //p'
+      )"
+    fi
     if [[ -z "$CHECKPOINT" ]]; then
       echo "No local checkpoint found; downloading Hub checkpoint '$HUB_VERSION'..."
       CHECKPOINT="$(
