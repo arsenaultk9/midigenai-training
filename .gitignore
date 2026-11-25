@@ -222,6 +222,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Models
+# Artifacts
 runs/
 models/
+generated.mid

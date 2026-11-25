@@ -20,19 +20,29 @@ The script performs the following steps:
 - Python 3.14+
 - Project dependencies installed: `uv sync`
 - A trained ONNX model exported to the `models/` folder (see [TRAINING.md](./TRAINING.md) for exporting)
-- A tokenizer file (auto-detected from common locations)
+- The tokenizer matching the model (auto-detected from common locations)
+
+Activate the virtual environment before running the examples:
+
+```bash
+source .venv/bin/activate
+```
+
+For the downloaded `v5` model, place its matching
+[`tokenizer.json`](https://huggingface.co/nicholasbien/midigenai/blob/main/v5/tokenizer.json)
+in `models/generic/`. A tokenizer from a different training run may be incompatible.
 
 ## Basic Usage
 
 ### Generate with Default Settings
 
 ```bash
-python generate_with_onnx.py models/orchestral-scratch
+python generate_with_onnx.py models/generic
 ```
 
 This will:
-- Use the CPU model (int8 quantized)
-- Generate 512 tokens with top-p=0.9 and temperature=1.0
+- Use the GPU model when the CUDA provider is available, otherwise the CPU model (int8 quantized)
+- Generate up to 512 tokens with top-p=0.9 and temperature=1.0 (stopping at EOS)
 - Save output to `generated.mid`
 - Use a random seed each time
 
@@ -67,6 +77,18 @@ python generate_with_onnx.py models/orchestral-scratch -t 50
 ```
 
 ### Sampling Parameters
+
+**Reducing exact repetition**
+
+The model can repeat phrases, especially with a one-note primer. To prevent
+the same token sequence from occurring twice, set an n-gram size:
+
+```bash
+python generate_with_onnx.py models/generic --no-repeat-ngram-size 12
+```
+
+This is disabled by default. It blocks exact token sequences, not repeated
+musical phrases expressed with different tokens, and may change musical structure.
 
 **Top-p Sampling (Nucleus Sampling)**
 
@@ -114,7 +136,9 @@ python generate_with_onnx.py models/orchestral-scratch --min-pitch 72 --max-pitc
 
 ### Device Selection
 
-By default, the script tries to use GPU if available, falling back to CPU:
+By default, the script selects the GPU model when ONNX Runtime provides the
+CUDA execution provider; otherwise it selects the CPU model. `--cpu` forces
+the CPU execution provider and prefers the CPU model:
 
 ```bash
 # Force CPU
@@ -183,7 +207,7 @@ usage: generate_with_onnx.py [-h] [--tokenizer-path TOKENIZER_PATH]
                              [-o OUTPUT] [-t TOKENS] [-p TOP_P]
                              [--temperature TEMPERATURE] [-s SEED]
                              [--min-pitch MIN_PITCH] [--max-pitch MAX_PITCH]
-                             [--cpu]
+                             [--cpu] [--no-repeat-ngram-size NO_REPEAT_NGRAM_SIZE]
                              model_path
 
 positional arguments:
@@ -201,6 +225,8 @@ options:
   --min-pitch MIN_PITCH Minimum MIDI pitch for primer note (default: 36 = C2)
   --max-pitch MAX_PITCH Maximum MIDI pitch for primer note (default: 84 = C6)
   --cpu                 Prefer CPU model over GPU
+  --no-repeat-ngram-size NO_REPEAT_NGRAM_SIZE
+                        Forbid repeated token sequences of this size (0 disables; minimum 2)
 ```
 
 ## Technical Details
@@ -212,7 +238,7 @@ The script supports ONNX models exported from midigenai training runs:
 - **GPU model**: `decoder-webgpu-q4.onnx` (4-bit quantized)
 - **CPU model**: `decoder-wasm-int8.onnx` (8-bit quantized)
 
-The script automatically selects the appropriate model based on available hardware.
+The script selects the model based on the available ONNX Runtime execution providers.
 
 ### Top-p Sampling
 
@@ -226,6 +252,8 @@ This avoids generating low-probability tokens while maintaining diversity.
 ### Token Encoding/Decoding
 
 Tokens are encoded/decoded using the midigenai tokenizer, which represents music as a sequence of discrete tokens. The primer is converted to MIDI, encoded to tokens, used as context, and the generated tokens are decoded back to MIDI.
+The model prompt includes the beginning-of-sequence token; generation stops at
+the end-of-sequence token, and v4 continuation-only special tokens are masked.
 
 ## Troubleshooting
 

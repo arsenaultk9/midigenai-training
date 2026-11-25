@@ -11,6 +11,7 @@ This script:
 
 import argparse
 import random
+import tempfile
 from pathlib import Path
 import json
 import numpy as np
@@ -148,6 +149,26 @@ def top_p_sampling(
     return int(top_p_indices[sampled_idx])
 
 
+def continuation_prompt(tok, prompt_ids: list[int]) -> list[int]:
+    """Prefix the MIDI body with BOS, as in the model's training documents."""
+    bos_id = tokenizer.special_id(tok, "BOS")
+    if bos_id is not None and (not prompt_ids or prompt_ids[0] != bos_id):
+        return [bos_id, *prompt_ids]
+    return list(prompt_ids)
+
+
+def repeated_ngram_next_tokens(tokens: list[int], size: int) -> set[int]:
+    """Find tokens that would complete a previously seen n-gram."""
+    if size < 2 or len(tokens) < size - 1:
+        return set()
+    prefix = tokens[-(size - 1):]
+    return {
+        tokens[i + size - 1]
+        for i in range(len(tokens) - size + 1)
+        if tokens[i:i + size - 1] == prefix
+    }
+
+
 def generate_with_onnx(
     session: rt.InferenceSession,
     prompt_ids: list[int],
@@ -156,6 +177,9 @@ def generate_with_onnx(
     top_p: float = 0.9,
     temperature: float = 1.0,
     seed: int | None = None,
+    eos_id: int | None = None,
+    ban_ids: list[int] | None = None,
+    no_repeat_ngram_size: int = 0,
 ) -> list[int]:
     """
     Generate tokens using an ONNX model session with KV cache support.
@@ -168,10 +192,15 @@ def generate_with_onnx(
         top_p: Top-p sampling parameter
         temperature: Sampling temperature
         seed: Random seed
+        eos_id: Stop when this token is sampled, without including it
+        ban_ids: Token IDs that are invalid in a continuation
+        no_repeat_ngram_size: Forbid repeated token sequences of this size (0 disables)
     
     Returns:
         List of generated token IDs
     """
+    if no_repeat_ngram_size < 0 or no_repeat_ngram_size == 1:
+        raise ValueError("no_repeat_ngram_size must be 0 or at least 2")
     generated = []
     
     # Get model info
@@ -182,12 +211,32 @@ def generate_with_onnx(
     print(f"Model outputs: {output_names[:5]}... ({len(output_names)} total)")
     
     n_layers = config.get("n_layers", 12)
-    
-    # Process prompt without updating cache for efficiency
+    if "new_k0" in output_names:
+        cache_output_prefix = "new"
+        cache_axis = 1
+        empty_cache_shape = (1, 0, config["n_heads"], config["head_dim"])
+    elif "present_k0" in output_names:
+        cache_output_prefix = "present"
+        cache_axis = 2
+        empty_cache_shape = (1, config["n_heads"], 0, config["head_dim"])
+    else:
+        raise ValueError("Unsupported ONNX model: unrecognized KV cache outputs")
+
+    expected_outputs = [
+        f"{cache_output_prefix}_{kind}{i}"
+        for i in range(n_layers)
+        for kind in ("k", "v")
+    ]
+    missing_outputs = set(expected_outputs) - set(output_names)
+    if missing_outputs:
+        raise ValueError(f"Missing KV cache outputs: {sorted(missing_outputs)}")
+
     tokens = np.array(prompt_ids, dtype=np.int64).reshape(1, -1)
-    
-    # Initialize KV cache placeholders
-    kv_cache = {}
+    kv_cache = {
+        f"past_{kind}{i}": np.zeros(empty_cache_shape, dtype=np.float32)
+        for i in range(n_layers)
+        for kind in ("k", "v")
+    }
     
     for step in range(max_tokens):
         if step == 0:
@@ -197,43 +246,11 @@ def generate_with_onnx(
             # Subsequent steps: only process last token
             input_ids = tokens[:, -1:]
         
-        # Prepare inputs
-        inputs = {"ids": input_ids}
+        inputs = {"ids": input_ids, **kv_cache}
+        outputs = session.run(output_names, inputs)
+        outputs_by_name = dict(zip(output_names, outputs))
         
-        # Add KV cache inputs
-        for i in range(n_layers):
-            k_name = f"past_k{i}"
-            v_name = f"past_v{i}"
-            
-            if k_name in kv_cache:
-                inputs[k_name] = kv_cache[k_name]
-                inputs[v_name] = kv_cache[v_name]
-            else:
-                # Initialize empty cache for first step
-                # Shape depends on model, using placeholder
-                batch_size = 1
-                seq_len = len(input_ids[0])
-                # Adjust shapes as needed - this is a placeholder
-                inputs[k_name] = np.zeros((batch_size, 0, config.get("n_heads", 12), config.get("head_dim", 64)), dtype=np.float32)
-                inputs[v_name] = np.zeros((batch_size, 0, config.get("n_heads", 12), config.get("head_dim", 64)), dtype=np.float32)
-        
-        # Run inference
-        try:
-            outputs = session.run(output_names, inputs)
-        except Exception as e:
-            # If cache handling fails, try without returning cache
-            print(f"Note: Inference with cache failed, retrying without cache management: {e}")
-            inputs_simple = {"ids": input_ids}
-            for i in range(n_layers):
-                k_name = f"past_k{i}"
-                v_name = f"past_v{i}"
-                # Create dummy tensors for cache
-                inputs_simple[k_name] = np.array([], dtype=np.float32).reshape(1, 0, 12, 64)
-                inputs_simple[v_name] = np.array([], dtype=np.float32).reshape(1, 0, 12, 64)
-            outputs = session.run(output_names, inputs_simple)
-        
-        # Get logits (first output)
-        logits = outputs[0]  # Shape should be (batch, vocab_size) or (batch, seq_len, vocab_size)
+        logits = outputs_by_name["logits"]
         
         # Get logits for the last token position
         if len(logits.shape) == 2:
@@ -243,8 +260,22 @@ def generate_with_onnx(
             # Shape: (batch, seq_len, vocab_size) - full sequence
             last_logits = logits[0, -1, :]
         
+        banned = set(ban_ids or [])
+        if no_repeat_ngram_size:
+            banned.update(
+                repeated_ngram_next_tokens(prompt_ids + generated, no_repeat_ngram_size)
+            )
+        if banned:
+            last_logits = last_logits.copy()
+            last_logits[list(banned)] = -np.inf
+            if not np.isfinite(last_logits).any():
+                raise ValueError("No valid tokens remain after applying sampling restrictions")
+
         # Sample next token using top-p
         next_token = top_p_sampling(last_logits, top_p=top_p, temperature=temperature)
+        if next_token == eos_id:
+            print(f"  End-of-sequence token sampled after {len(generated)} tokens")
+            break
         generated.append(next_token)
         
         # Append to token sequence
@@ -252,15 +283,15 @@ def generate_with_onnx(
         
         # Update KV cache for next iteration
         for i in range(n_layers):
-            k_name = f"new_k{i}"
-            v_name = f"new_v{i}"
-            if k_name in {o.name for o in session.get_outputs()}:
-                kv_idx = output_names.index(k_name)
-                vkv_idx = output_names.index(v_name)
-                if kv_idx < len(outputs):
-                    kv_cache[f"past_k{i}"] = outputs[kv_idx]
-                if vkv_idx < len(outputs):
-                    kv_cache[f"past_v{i}"] = outputs[vkv_idx]
+            for kind in ("k", "v"):
+                input_name = f"past_{kind}{i}"
+                cache_output = outputs_by_name[f"{cache_output_prefix}_{kind}{i}"]
+                if cache_output_prefix == "new":
+                    kv_cache[input_name] = np.concatenate(
+                        (kv_cache[input_name], cache_output), axis=cache_axis
+                    )
+                else:
+                    kv_cache[input_name] = cache_output
         
         if (step + 1) % 50 == 0 or step < 5:
             print(f"  Generated {step + 1}/{max_tokens} tokens (token_id={next_token})")
@@ -279,6 +310,7 @@ def generate_music(
     min_pitch: int = 36,
     max_pitch: int = 84,
     prefer_gpu: bool = True,
+    no_repeat_ngram_size: int = 0,
 ) -> None:
     """
     Generate music using an ONNX model and top-p sampling.
@@ -294,6 +326,7 @@ def generate_music(
         min_pitch: Minimum MIDI pitch for primer note
         max_pitch: Maximum MIDI pitch for primer note
         prefer_gpu: Prefer GPU model if available
+        no_repeat_ngram_size: Forbid repeated token sequences of this size (0 disables)
     """
     if seed is not None:
         random.seed(seed)
@@ -309,8 +342,11 @@ def generate_music(
     config = load_model_config(model_path)
     print(f"Model info: {config['version']}, vocab_size={config['vocab_size']}")
     
-    # Get the ONNX model file
-    onnx_model_path = get_onnx_model_path(model_path, prefer_gpu=prefer_gpu)
+    # Select the model for the execution provider actually available.
+    use_gpu = prefer_gpu and "CUDAExecutionProvider" in rt.get_available_providers()
+    if prefer_gpu and not use_gpu:
+        print("CUDA execution provider unavailable; using CPU.")
+    onnx_model_path = get_onnx_model_path(model_path, prefer_gpu=use_gpu)
     print(f"Using model: {onnx_model_path.name}")
     
     # Auto-detect tokenizer if not provided
@@ -334,6 +370,11 @@ def generate_music(
     
     print(f"Using tokenizer: {tokenizer_path}")
     tok = tokenizer.load_tokenizer(tokenizer_path)
+    if len(tok.vocab) != config["vocab_size"]:
+        raise ValueError(
+            f"Tokenizer has {len(tok.vocab)} tokens, but the model expects "
+            f"{config['vocab_size']}; use the tokenizer matching the model."
+        )
     
     # Initialize ONNX Runtime session
     print("Initializing ONNX Runtime session...")
@@ -342,7 +383,7 @@ def generate_music(
     
     # Choose execution provider
     providers = []
-    if prefer_gpu:
+    if use_gpu:
         providers.append("CUDAExecutionProvider")
     providers.append("CPUExecutionProvider")
     
@@ -357,13 +398,22 @@ def generate_music(
     )
     
     # Save primer temporarily and encode it
-    primer_temp_path = Path("/tmp/primer_temp.mid")
-    primer_score.dump_midi(str(primer_temp_path))
-    
-    print(f"Encoding primer...")
-    prompt_ids = tokenizer.encode_midi(tok, primer_temp_path)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        primer_temp_path = Path(temp_dir) / "primer.mid"
+        primer_score.dump_midi(str(primer_temp_path))
+        print("Encoding primer...")
+        prompt_ids = tokenizer.encode_midi(tok, primer_temp_path)
     print(f"Primer encoded: {len(prompt_ids)} tokens")
     print(f"First 10 prompt tokens: {prompt_ids[:10]}")
+    model_prompt = continuation_prompt(tok, prompt_ids)
+    eos_id = tokenizer.special_id(tok, "EOS")
+    ban_ids = []
+    if tokenizer.is_v4(tok):
+        ban_ids = [
+            token_id
+            for name in ("BOS", "SEP", "MASK")
+            if (token_id := tokenizer.special_id(tok, name)) is not None
+        ]
     
     # Generate using top-p sampling
     print(
@@ -373,12 +423,15 @@ def generate_music(
     
     generated_ids = generate_with_onnx(
         session=session,
-        prompt_ids=prompt_ids,
+        prompt_ids=model_prompt,
         config=config,
         max_tokens=max_tokens,
         top_p=top_p,
         temperature=temperature,
         seed=seed,
+        eos_id=eos_id,
+        ban_ids=ban_ids,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
     
     print(f"Generated {len(generated_ids)} tokens")
@@ -390,9 +443,6 @@ def generate_music(
     output_path = Path(output_path)
     print(f"Decoding to MIDI: {output_path}")
     tokenizer.decode_to_midi(tok, all_ids, output_path)
-    
-    # Clean up
-    primer_temp_path.unlink()
     
     print(f"✓ Generation complete! Output: {output_path}")
     
@@ -473,6 +523,12 @@ def main():
         action="store_true",
         help="Prefer CPU model over GPU",
     )
+    parser.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=0,
+        help="Forbid repeated token sequences of this size (0 disables; minimum 2)",
+    )
     
     args = parser.parse_args()
     
@@ -487,6 +543,7 @@ def main():
         min_pitch=args.min_pitch,
         max_pitch=args.max_pitch,
         prefer_gpu=not args.cpu,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
     )
 
 
